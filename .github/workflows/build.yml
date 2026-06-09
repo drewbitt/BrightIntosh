@@ -9,7 +9,7 @@ on:
         default: main
         type: string
       force:
-        description: 'Build even if upstream SHA matches the last release'
+        description: 'Build even if this upstream commit already has a release'
         required: false
         default: false
         type: boolean
@@ -17,11 +17,15 @@ on:
     - cron: '17 9 * * *'   # daily at 09:17 UTC
 
 permissions:
-  contents: read   # tightened; build job overrides to write for release publishing
+  contents: read   # build job overrides to write for publishing
 
 concurrency:
   group: build-${{ github.event.inputs.ref || 'main' }}
   cancel-in-progress: true
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
 
 jobs:
   check:
@@ -33,34 +37,25 @@ jobs:
     steps:
       - id: r
         env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
           REF: ${{ github.event.inputs.ref || 'main' }}
           FORCE: ${{ github.event.inputs.force }}
         run: |
           set -euo pipefail
           SHA=$(gh api "repos/niklasr22/BrightIntosh/commits/${REF}" --jq .sha)
+          SHORT=${SHA:0:7}
           echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
-          echo "short=${SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "short=${SHORT}" >> "$GITHUB_OUTPUT"
           echo "Upstream ${REF} -> ${SHA}"
-
-          if [ "${FORCE}" = "true" ]; then
+          # Build only if this upstream commit doesn't already have a release.
+          if [ "${FORCE}" = "true" ] || ! gh release view "build-${SHORT}" >/dev/null 2>&1; then
             echo "build=true" >> "$GITHUB_OUTPUT"
-            echo "force=true requested — building."
-            exit 0
-          fi
-          BODY=$(gh release view latest --json body --jq .body 2>/dev/null || true)
-          if printf '%s' "$BODY" | grep -qF "upstream-sha: ${SHA}"; then
-            echo "build=false" >> "$GITHUB_OUTPUT"
-            echo "Upstream unchanged — skipping build."
           else
-            echo "build=true" >> "$GITHUB_OUTPUT"
-            echo "Upstream changed or no SHA marker — building."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Already released — skipping."
           fi
 
-  # GitHub disables scheduled workflows after 60 days of repo inactivity.
-  # Hitting the workflow's "enable" endpoint resets the inactivity timer
-  # without polluting commit history. No-op when the workflow is enabled.
+  # GitHub disables scheduled workflows after 60 days of repo inactivity;
+  # hitting the "enable" endpoint resets that timer.
   # See: https://github.com/liskin/gh-workflow-keepalive
   keepalive:
     if: github.event_name == 'schedule'
@@ -68,16 +63,14 @@ jobs:
     permissions:
       actions: write
     steps:
-      - env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/build.yml/enable"
+      - run: gh api -X PUT "repos/${GH_REPO}/actions/workflows/build.yml/enable"
 
   build:
     needs: check
     if: needs.check.outputs.build == 'true'
     runs-on: macos-26
     permissions:
-      contents: write   # for `gh release upload` / `edit` / `create`
+      contents: write   # for `gh release create` / `delete`
     steps:
       - uses: actions/checkout@v6
         with:
@@ -102,7 +95,6 @@ jobs:
             build
 
       - name: Ad-hoc sign and zip
-        id: sign
         run: |
           set -euo pipefail
           APP=$(find build/Build/Products -type d -name BrightIntosh.app | head -n1)
@@ -111,31 +103,32 @@ jobs:
             | while read -r b; do codesign --force --sign - "$b"; done
           codesign --force --sign - "$APP"
           ditto -c -k --keepParent "$APP" BrightIntosh.zip
-          echo "app=$APP" >> "$GITHUB_OUTPUT"
 
-      - name: Publish rolling release
+      - name: Publish release
         env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
           SHA: ${{ needs.check.outputs.sha }}
           SHORT: ${{ needs.check.outputs.short }}
         run: |
           set -euo pipefail
           DATE=$(date -u +%Y-%m-%d)
-          TITLE="Latest build — ${DATE} (upstream ${SHORT})"
-          NOTES=$(cat <<EOF
-          Auto-built from [niklasr22/BrightIntosh@${SHORT}](https://github.com/niklasr22/BrightIntosh/commit/${SHA}). Non-Store scheme, ad-hoc signed.
+          NOTES="Auto-built from [niklasr22/BrightIntosh@${SHORT}](https://github.com/niklasr22/BrightIntosh/commit/${SHA}). Non-Store scheme, ad-hoc signed.
 
           **Install:** unzip, then \`xattr -cr /Applications/BrightIntosh.app\` to clear quarantine.
 
-          <!-- upstream-sha: ${SHA} -->
-          EOF
-          )
-          # Upsert: edit + clobber asset if release exists, otherwise create.
-          # Avoids tearing down and recreating the `latest` tag on every build.
-          if gh release view latest >/dev/null 2>&1; then
-            gh release upload latest BrightIntosh.zip --clobber
-            gh release edit latest --title "$TITLE" --notes "$NOTES"
-          else
-            gh release create latest BrightIntosh.zip --title "$TITLE" --notes "$NOTES"
-          fi
+          Always-newest link: <https://github.com/${GH_REPO}/releases/latest/download/BrightIntosh.zip>"
+          # One release per upstream commit; --latest holds the stable download
+          # URL. The delete lets a forced re-run replace that commit's release.
+          gh release delete "build-${SHORT}" --cleanup-tag --yes 2>/dev/null || true
+          gh release create "build-${SHORT}" BrightIntosh.zip \
+            --title "Build ${DATE} — upstream ${SHORT}" \
+            --notes "${NOTES}" --latest
+
+      - name: Prune old releases (keep newest 10)
+        run: |
+          set -euo pipefail
+          gh release list -L 100 --json tagName,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[10:][].tagName' \
+            | while read -r t; do
+                echo "Pruning ${t}"
+                gh release delete "$t" --cleanup-tag --yes
+              done
